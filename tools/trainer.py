@@ -26,6 +26,7 @@ sys.path.append(os.path.abspath(os.path.join(__dir__, '..')))
 
 from utils.utils_single import load_yaml, load_dy_model_class, get_abs_model, create_data_loader
 from utils.save_load import load_model, save_model
+from utils.loggers import VDLLogger, WandbLogger, Loggers
 from paddle.io import DistributedBatchSampler, DataLoader
 import argparse
 
@@ -68,6 +69,7 @@ def main(args):
     use_npu = config.get("runner.use_npu", False)
     use_xpu = config.get("runner.use_xpu", False)
     use_visual = config.get("runner.use_visual", False)
+    use_wandb = config.get("runner.use_wandb", False)
     train_data_dir = config.get("runner.train_data_dir", None)
     epochs = config.get("runner.epochs", None)
     print_interval = config.get("runner.print_interval", None)
@@ -97,9 +99,37 @@ def main(args):
     dy_model = dy_model_class.create_model(config)
 
     # Create a log_visual object and store the data in the path
-    if use_visual:
-        from visualdl import LogWriter
-        log_visual = LogWriter(args.abs_dir + "/visualDL_log/train")
+    loggers = []
+    if use_fleet:
+        trainer_id = paddle.distributed.get_rank()
+        if trainer_id == 0:
+            if use_visual:
+                loggers.append(VDLLogger(save_dir=args.abs_dir + "/visualDL_log/train"))
+    
+            if use_wandb:
+                wandb_config = dict()
+
+                for key, val in config.items():
+                    if key.startswith("runner.wandb"):
+                        wandb_config.update({
+                            key.split(".")[-1]: val
+                        })
+
+                loggers.append(WandbLogger(config=config, **wandb_config))
+    else:
+        if use_visual:
+            loggers.append(VDLLogger(save_dir=args.abs_dir + "/visualDL_log/train"))
+        if use_wandb:
+            wandb_config = dict()
+
+            for key, val in config.items():
+                if key.startswith("runner.wandb"):
+                    wandb_config.update({
+                        key.split(".")[-1]: val
+                    })
+            loggers.append(WandbLogger(config=config, **wandb_config))
+    
+    loggers = Loggers(loggers=loggers)
 
     if model_init_path is not None:
         load_model(model_init_path, dy_model)
@@ -153,27 +183,23 @@ def main(args):
 
             if batch_id % print_interval == 0:
                 metric_str = ""
+                metrics = dict()
                 for metric_id in range(len(metric_list_name)):
                     metric_str += (
                         metric_list_name[metric_id] +
                         ":{:.6f}, ".format(metric_list[metric_id].accumulate())
                     )
-                    if use_visual:
-                        log_visual.add_scalar(
-                            tag="train/" + metric_list_name[metric_id],
-                            step=step_num,
-                            value=metric_list[metric_id].accumulate())
+                    metrics.update({
+                        metric_list_name[metric_id]: metric_list[metric_id].accumulate()
+                    })
+                loggers.log_metrics(metrics, prefix="train", step=step_num)
                 tensor_print_str = ""
                 if tensor_print_dict is not None:
                     for var_name, var in tensor_print_dict.items():
                         tensor_print_str += (
                             "{}:".format(var_name) +
                             str(var.numpy()).strip("[]") + ",")
-                        if use_visual:
-                            log_visual.add_scalar(
-                                tag="train/" + var_name,
-                                step=step_num,
-                                value=var.numpy())
+                loggers.log_metrics(tensor_print_dict, prefix="train", step=step_num)
                 logger.info(
                     "epoch: {}, batch_id: {}, ".format(
                         epoch_id, batch_id) + metric_str + tensor_print_str +
@@ -216,9 +242,19 @@ def main(args):
                     model_save_path,
                     epoch_id,
                     prefix='rec')
+                loggers.log_model(
+                    model_save_path,
+                    prefix='rec',
+                    aliases=[epoch_id]
+                )
         else:
             save_model(
                 dy_model, optimizer, model_save_path, epoch_id, prefix='rec')
+            loggers.log_model(
+                model_save_path,
+                epoch_id=epoch_id,
+                prefix='rec'
+            )
 
 
 if __name__ == '__main__':
